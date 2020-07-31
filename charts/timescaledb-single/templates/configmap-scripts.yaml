@@ -102,6 +102,61 @@ data:
     PGDATA={{ include "data_directory" . | quote }}
     WALDIR={{ include "wal_directory" . | quote }}
 
+    # Until the following issue is resolved, it could be that a previous init process failed,
+    # which did clean up the data directory, but not the wal directory, or the tablespaces
+    # We only move the directories if they're not empty
+    # https://github.com/zalando/patroni/pull/1631
+    POSTFIX=$(date +%Y%m%d%H%M%S)
+    if [ -d "${WALDIR}" -a ! -z "$(ls -A "${WALDIR}")" ]
+    then
+        log "Moving previously created WALDIR"
+        mv -v "${WALDIR}"{,-${POSTFIX}}
+    fi
+
+    TABLESPACES={{ $.Values.persistentVolumes.tablespaces | default dict | keys | join " " | quote }}
+    for tablespace in $TABLESPACES
+    do
+        tablespacedir="{{ include "tablespaces_dir" . }}/${tablespace}/data"
+        if [ -d "${tablespacedir}" -a ! -z "$(ls -A "${tablespacedir}")" ]
+        then
+            log "Moving previously created tablespace ${tablespace}"
+            mv -v "${tablespacedir}"{,-${POSTFIX}}
+        fi
+    done
+
+    # A missing PGDATA points to Patroni removing a botched PGDATA, or manual
+    # intervention. In this scenario, we need to recreate the DATA and WALDIRs
+    # to keep pgBackRest happy
+    [ -d "${PGDATA}" ] || install -o postgres -g postgres -d -m 0700 "${PGDATA}"
+    [ -d "${WALDIR}" ] || install -o postgres -g postgres -d -m 0700 "${WALDIR}"
+
+    if [ "${BOOTSTRAP_FROM_BACKUP}" == "1" ]; then
+        log "Attempting restore from backup"
+        # we want to override the environment with the environment
+        export $(env -i envdir {{ template "pgbackrest_bootstrap_environment_dir" . | quote }} env) > /dev/null
+        export PGBACKREST_REPO1_PATH={{ index .Values.bootstrapFromBackup "repo1-path" | quote }}
+
+        if [ "${PGBACKREST_REPO1_PATH}" == "" ]; then
+            log "Unconfigured repository path"
+            cat << "__EOT__"
+
+    TimescaleDB Single Helm Chart error:
+
+    You should configure the bootstrapFromBackup in your Helm Chart section by explicitly setting
+    the repo1-path to point to the backups.
+
+    For example, if you want to do a disaster recovery, and you want to reuse
+    the backup, you could configure the path as follows:
+
+    ```yaml
+    bootstrapFromBackup:
+      enabled: true
+      repo1-path: {{ (printf "/%s/%s/" .Release.Namespace (include "clusterName" . )) | quote }}
+    ```
+
+    For more information, consult the admin guide:
+    https://github.com/timescale/timescaledb-kubernetes/blob/master/charts/timescaledb-single/admin-guide.md#bootstrap-from-backup
+
     # Patroni attaches --scope and --datadir to the arguments, we need to strip them off as
     # initdb has no business with these parameters
     initdb_args=""
@@ -145,7 +200,20 @@ data:
     __SQL__
     done
 
-    # We always exit 0 this script, otherwise the database initialization fails.
+    # This directory may contain user defined post init steps
+    for file in $(ls {{ template "post_init_dir" . | quote }} | sort)
+    do
+        log "Calling post init script $file"
+        "{{ template "post_init_dir" . }}/$file" $@
+        EXITCODE=$?
+        if [ "$EXITCODE" != "0" ]
+        then
+            log "ERROR: post init script $file exited with exitcode $EXITCODE"
+            exit $EXITCODE
+        fi
+    done
+
+    # We exit 0 this script, otherwise the database initialization fails.
     exit 0
   patroni_callback.sh: |
     #!/bin/bash
